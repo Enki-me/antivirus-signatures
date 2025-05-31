@@ -1,1 +1,197 @@
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+import os
+import shutil
+import hashlib
+import requests
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+from threading import Thread
+from datetime import datetime
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+# -------- Configuration --------
+SIGNATURE_URL = "https://example.com/virus-signatures.txt"  # Replace with your real URL
+QUARANTINE_FOLDER = os.path.join(os.getcwd(), "quarantine")
+os.makedirs(QUARANTINE_FOLDER, exist_ok=True)
+
+# -------- Signature Fetching --------
+def fetch_signatures_from_url(url):
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return set(line.strip() for line in response.text.splitlines() if line.strip())
+    except Exception as e:
+        print(f"Error fetching signatures: {e}")
+        return set()
+
+VIRUS_SIGNATURES = fetch_signatures_from_url(SIGNATURE_URL)
+
+# -------- Utility Functions --------
+def get_file_hash(file_path):
+    hasher = hashlib.sha256()
+    try:
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b''):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except Exception as e:
+        return None, str(e)
+
+def quarantine_file(file_path):
+    try:
+        filename = os.path.basename(file_path)
+        quarantine_path = os.path.join(QUARANTINE_FOLDER, filename)
+        shutil.move(file_path, quarantine_path)
+        return True
+    except Exception as e:
+        return str(e)
+
+def log_output(output_box, message, tag=None):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    output_box.insert(tk.END, f"[{timestamp}] {message}\n", tag)
+    output_box.see(tk.END)
+
+# -------- File System Event Handler --------
+class VirusScanHandler(FileSystemEventHandler):
+    def __init__(self, output_box):
+        self.output_box = output_box
+
+    def scan_file(self, file_path):
+        file_hash = get_file_hash(file_path)
+        if isinstance(file_hash, tuple):
+            _, err = file_hash
+            log_output(self.output_box, f"❌ Error reading file: {err}", "error")
+            return
+
+        if file_hash in VIRUS_SIGNATURES:
+            result = quarantine_file(file_path)
+            if result is True:
+                log_output(self.output_box, f"⚠️ Virus quarantined: {file_path}", "warning")
+            else:
+                log_output(self.output_box, f"❌ Failed to quarantine: {file_path} — {result}", "error")
+        else:
+            log_output(self.output_box, f"[SAFE] {file_path}", "safe")
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self.scan_file(event.src_path)
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            self.scan_file(event.src_path)
+
+# -------- Manual Scan --------
+def scan_directory(directory, output_box):
+    infected_files = []
+    for root, _, files in os.walk(directory):
+        for name in files:
+            file_path = os.path.join(root, name)
+            file_hash = get_file_hash(file_path)
+            if isinstance(file_hash, tuple):
+                _, err = file_hash
+                log_output(output_box, f"❌ Error reading file: {err}", "error")
+                continue
+            if file_hash in VIRUS_SIGNATURES:
+                result = quarantine_file(file_path)
+                if result is True:
+                    infected_files.append(file_path)
+                    log_output(output_box, f"⚠️ Virus quarantined: {file_path}", "warning")
+                else:
+                    log_output(output_box, f"❌ Failed to quarantine: {file_path} — {result}", "error")
+    log_output(output_box, "🔍 Scan Complete.\n")
+    if not infected_files:
+        log_output(output_box, "✅ No infected files detected.", "safe")
+
+# -------- GUI Setup --------
+def start_gui():
+    observer_instance = [None]  # Mutable to allow reassignment in nested scope
+
+    def browse_folder():
+        folder = filedialog.askdirectory()
+        if folder:
+            entry.delete(0, tk.END)
+            entry.insert(0, folder)
+
+    def start_scan():
+        directory = entry.get()
+        if not os.path.exists(directory):
+            messagebox.showerror("Error", "Invalid path.")
+            return
+        output_box.delete(1.0, tk.END)
+        log_output(output_box, f"📁 Scanning directory: {directory}")
+        Thread(target=scan_directory, args=(directory, output_box), daemon=True).start()
+
+    def start_real_time_protection():
+        if observer_instance[0]:
+            log_output(output_box, "⚠️ Real-time protection is already running.", "info")
+            return
+        directory = entry.get()
+        if not os.path.exists(directory):
+            messagebox.showerror("Error", "Invalid path.")
+            return
+        log_output(output_box, f"🛡️ Real-time protection started on: {directory}", "info")
+        event_handler = VirusScanHandler(output_box)
+        observer = Observer()
+        observer.schedule(event_handler, directory, recursive=True)
+        observer.start()
+        observer_instance[0] = observer
+        Thread(target=observer.join, daemon=True).start()
+
+    def stop_real_time_protection():
+        if observer_instance[0]:
+            observer_instance[0].stop()
+            observer_instance[0].join()
+            observer_instance[0] = None
+            log_output(output_box, "🛑 Real-time protection stopped.", "info")
+
+    def refresh_signatures():
+        nonlocal VIRUS_SIGNATURES
+        new_sigs = fetch_signatures_from_url(SIGNATURE_URL)
+        if new_sigs:
+            VIRUS_SIGNATURES.clear()
+            VIRUS_SIGNATURES.update(new_sigs)
+            log_output(output_box, "✅ Signatures updated from online source.", "info")
+        else:
+            log_output(output_box, "⚠️ Failed to update signatures.", "warning")
+
+    # ---- GUI Components ----
+    root = tk.Tk()
+    root.title("Simple Antivirus App")
+    root.geometry("700x500")
+    root.resizable(False, False)
+
+    frame = tk.Frame(root)
+    frame.pack(pady=10)
+
+    entry = tk.Entry(frame, width=50)
+    entry.pack(side=tk.LEFT, padx=5)
+
+    browse_btn = tk.Button(frame, text="Browse", command=browse_folder)
+    browse_btn.pack(side=tk.LEFT)
+
+    scan_btn = tk.Button(root, text="Start Manual Scan", width=30, command=start_scan)
+    scan_btn.pack(pady=5)
+
+    real_time_btn = tk.Button(root, text="Start Real-Time Protection", width=30, command=start_real_time_protection)
+    real_time_btn.pack(pady=5)
+
+    stop_btn = tk.Button(root, text="Stop Real-Time Protection", width=30, command=stop_real_time_protection)
+    stop_btn.pack(pady=5)
+
+    refresh_btn = tk.Button(root, text="Refresh Virus Signatures", width=30, command=refresh_signatures)
+    refresh_btn.pack(pady=5)
+
+    output_box = scrolledtext.ScrolledText(root, wrap=tk.WORD, width=85, height=18)
+    output_box.pack(padx=10, pady=10)
+
+    output_box.tag_config("warning", foreground="red")
+    output_box.tag_config("safe", foreground="green")
+    output_box.tag_config("info", foreground="blue")
+    output_box.tag_config("error", foreground="orange")
+
+    root.mainloop()
+
+# -------- Run App --------
+if __name__ == "__main__":
+    start_gui()
